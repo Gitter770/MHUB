@@ -1,0 +1,41 @@
+name: Deploy to GitHub Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp "M1 Hub.html" _site/index.html
+          cp "M1 Hub.html" _site/
+          cp "M1 Hub.pdf" _site/
+          if [ -f "M1 Hub (offline).html" ]; then cp "M1 Hub (offline).html" _site/; fi
+          # the hub files (hb/) and atlas picture packs (at/) are fetched beside the page: without them every block hub is a 404
+          for d in hb at; do if [ -d "$d" ]; then cp -r "$d" _site/; fi; done
+          # build.txt names the current build: an open or cached page of an older build reloads past the cache when it differs
+          if [ -f build.txt ]; then cp build.txt _site/; fi
+          test -f _site/hb/cv1.0.txt || { echo "hb/ missing from the site"; exit 1; }
+          touch _site/.nojekyll
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
