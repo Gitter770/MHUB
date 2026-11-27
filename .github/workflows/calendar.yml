@@ -1,0 +1,63 @@
+name: Entrada calendar
+# Entrada does not let other websites read a calendar feed (no CORS), so the hub page cannot fetch it from the browser. This job does it
+# on GitHub every hour (and when the hub's Refresh asks): for each user in the HUB_KEY secret ("<user>:<progress key>", comma separated;
+# the hub's Settings shows it) it reads the feed link from that user's encrypted progress, fetches the feed, and stores it encrypted with
+# the same key beside the progress file (progress/<user>-ics.json on the progress branch), only when it changed. Nothing readable is stored.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: calendar
+  cancel-in-progress: false
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch, encrypt and store each user's calendar
+        env:
+          HUB_KEY: ${{ secrets.HUB_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > cal.js <<'JS'
+          const crypto = require('crypto'), zlib = require('zlib');
+          const keys = String(process.env.HUB_KEY || '').split(',').map(s => s.trim()).filter(s => s.includes(':'));
+          if (!keys.length){ console.log('::notice::No HUB_KEY secret yet: the hub (Settings, Entrada calendar, Refresh) shows the value to add.'); process.exit(0); }
+          const H = { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'm1hub-calendar' };
+          const api = p => `${process.env.GH_API || 'https://api.github.com'}/repos/${process.env.REPO}/contents/${p}`;
+          const open = (f, key) => { const data = Buffer.from(f.data, 'base64'), d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(f.iv, 'base64')); d.setAuthTag(data.subarray(data.length - 16)); return Buffer.concat([d.update(data.subarray(0, data.length - 16)), d.final()]); };
+          (async () => {
+            for (const k of keys){
+              const user = k.slice(0, k.indexOf(':')), key = Buffer.from(k.slice(k.indexOf(':') + 1), 'base64');
+              if (!/^[\w-]+$/.test(user) || key.length !== 32){ console.log('::warning::HUB_KEY entry for ' + user + ' is not a user and a 32-byte key'); continue; }
+              let url = '';
+              try {
+                const r = await fetch(api(`progress/${user}.json`) + '?ref=progress', { headers: Object.assign({}, H, { Accept: 'application/vnd.github.raw+json' }) });
+                if (!r.ok) throw new Error('progress file: HTTP ' + r.status);
+                const o = JSON.parse(open(await r.json(), key).toString()), ics = JSON.parse((o.data || {})['m1hub.ics'] || 'null');
+                url = ((ics && ics.url) || '').trim().replace(/^webcal:/i, 'https:');
+              } catch (e) { console.log('::warning::' + user + ': could not read the feed link from the progress (' + e.message + ')'); continue; }
+              if (!/^https?:\/\//.test(url)){ console.log(user + ': no calendar link saved in the hub yet'); continue; }
+              let text;
+              try { const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (M1 Hub calendar)', Accept: 'text/calendar,*/*' } }); if (!r.ok) throw new Error('HTTP ' + r.status); text = await r.text(); if (!/BEGIN:VCALENDAR/.test(text)) throw new Error('the reply is not an iCalendar feed'); }
+              catch (e) { console.log('::warning::' + user + ': Entrada could not be read (' + e.message + ')'); continue; }
+              const h = crypto.createHmac('sha256', key).update(text).digest('base64');
+              let sha = null, old = null;
+              const g = await fetch(api(`progress/${user}-ics.json`) + '?ref=progress', { headers: H });
+              if (g.ok){ const j = await g.json(); sha = j.sha; try { old = JSON.parse(Buffer.from(j.content || '', 'base64').toString()); } catch (e) {} }
+              if (old && old.h === h){ console.log(user + ': unchanged'); continue; }
+              const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', key, iv);
+              const pt = zlib.gzipSync(Buffer.from(JSON.stringify({ v: 1, at: Date.now(), text }))), ct = Buffer.concat([c.update(pt), c.final(), c.getAuthTag()]);
+              const body = { message: 'calendar', branch: 'progress', content: Buffer.from(JSON.stringify({ v: 1, h, iv: iv.toString('base64'), data: ct.toString('base64') })).toString('base64') };
+              if (sha) body.sha = sha;
+              const p = await fetch(api(`progress/${user}-ics.json`), { method: 'PUT', headers: H, body: JSON.stringify(body) });
+              if (!p.ok){ console.log('::error::' + user + ': storing failed, HTTP ' + p.status + ' ' + (await p.text()).slice(0, 200)); process.exitCode = 1; continue; }
+              console.log(user + ': stored (' + text.length + ' characters of calendar)');
+            }
+          })();
+          JS
+          node cal.js
